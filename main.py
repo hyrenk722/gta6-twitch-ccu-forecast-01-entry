@@ -1,4 +1,4 @@
-"""Launch-day Twitch audience forecaster -- rebuild v2.
+"""Launch-day Twitch audience forecaster -- rebuild v2 (max-upgrade v3).
 
 Competition: gta6-twitch-ccu-forecast-01 (make.fun). The program reads one
 case file per run from the input directory and writes five quantiles
@@ -24,6 +24,19 @@ for the target and for each comparable:
 (Two further descriptors -- a front-loading ratio and viewers per
 channel -- are computed by the same machinery but their kernels are
 disabled in the shipped parameters: leave-one-out showed they hurt.)
+A fourth kernel compares the launch's unlock pattern -- early access,
+midnight-local rolling, or one simultaneous global unlock -- classified
+from the case notes and each comparable's unlock text; launches whose
+audience was partly spent before release day have different shapes,
+and leave-one-out (plus a nested holdout that re-selected the kernel
+width out-of-sample) showed the comparison helps at every scale.
+
+Small launches (first hour under 50k) behaved differently enough in
+leave-one-out that they get their own parameters -- a tighter
+pre-release-peak kernel and the Gaussian fit alone -- averaged over
+two neighbouring peak widths as a small ensemble; large launches keep
+the parameters above. Both the split and the ensemble survived the
+same nested-holdout check.
 
 For each hour, the pooled shapes give two quantile estimates of x -- a
 weighted Gaussian fit and a weighted empirical quantile curve -- which
@@ -72,8 +85,13 @@ PARAMS = {
     "bw_ramp": 0.3,       # kernel width on log10(anchor / trailing mean)
     "trail_hours": 6,     # window of the trailing mean behind the ramp
     "bw_vpc": None,       # kernel width on log10(viewers per channel, h1)
+    "bw_unlock": 0.7,     # kernel width on the unlock-class one-hot
     "empirical_share": 0.5,   # blend weight of the empirical quantiles
     "spread": 0.95,       # calibration multiplier on the log-spread
+    "regime_threshold": 50000.0,  # hour-1 print splitting the two regimes
+    "small_peak_a": 0.35,     # small-regime peak widths, ensembled 50/50
+    "small_peak_b": 0.40,
+    "small_empirical_share": 0.0,  # small regime: Gaussian fit alone
     "ess_target": 2.0,    # stabilise an hour's pool up to this eff. size
     "ess_mix_max": 0.8,   # cap on the scale-only weight admixture
     "ess_ref": 6.0,       # below this eff. size an hour's spread widens
@@ -154,7 +172,80 @@ def _peak_before(points, key, lo, hi):
     return best
 
 
-def _descriptors(anchor, pre_peak, trail_mean=None, channels=None):
+def _clauses(t):
+    """Split a note into sentence-ish clauses on '.', ';' and newlines."""
+    parts = [t]
+    for sep in ("\n", ";", "."):
+        parts = [piece for part in parts for piece in part.split(sep)]
+    return [piece.strip() for piece in parts if piece.strip()]
+
+
+def _evidence(clauses, keywords, negations):
+    """True when some clause states a keyword without negating it in
+    the same clause (a negation in one clause must not suppress an
+    affirmative statement in another)."""
+    for clause in clauses:
+        if any(k in clause for k in keywords) and not any(
+                n in clause for n in negations):
+            return True
+    return False
+
+
+def _unlock_class(text):
+    """Coarse unlock-pattern class from free text, else None.
+
+    When the text carries a "real unlock:" marker (the house notes
+    template), only the segment from the marker on is classified --
+    the rest of a long note (sources, premieres, leaks) cannot flip
+    the class. Matching is clause-scoped with per-class negations,
+    and a bare "beta" or a bare "global" does not count: the pattern
+    must be stated as an unlock pattern, not mentioned in passing.
+    Non-string input is never classified (no stringified matching).
+    """
+    if not isinstance(text, str):
+        return None
+    t = text.casefold()
+    marker = t.find("real unlock")
+    if marker >= 0:
+        t = t[marker:]
+    clauses = _clauses(t)
+    if _evidence(clauses,
+                 ("early access", "early-access", "earlyaccess",
+                  "beta test", "open beta", "closed beta", "beta days",
+                  "beta access", "multiplayer beta", "network test",
+                  "pre-release test", "test days"),
+                 ("no early access", "no early-access",
+                  "not early access", "without early access",
+                  "never had early access", "early access: none")):
+        return "early"
+    if _evidence(clauses,
+                 ("midnight", "12 am local", "00:00 local"),
+                 ("no midnight", "not a midnight", "not midnight",
+                  "no midnight unlock")):
+        return "midnight"
+    if _evidence(clauses,
+                 ("simultaneous", "global unlock", "global release",
+                  "global launch"),
+                 ("no simultaneous", "not simultaneous", "not a global",
+                  "no global", "no global unlock")):
+        return "global"
+    return None
+
+
+def _unlock_extra(text):
+    """One-hot kernel coordinates for the unlock class of a launch."""
+    cls = _unlock_class(text)
+    if cls == "early":
+        return {"u_e": 1.0, "u_g": 0.0, "u_m": 0.0}
+    if cls == "global":
+        return {"u_e": 0.0, "u_g": 1.0, "u_m": 0.0}
+    if cls == "midnight":
+        return {"u_e": 0.0, "u_g": 0.0, "u_m": 1.0}
+    return {}
+
+
+def _descriptors(anchor, pre_peak, trail_mean=None, channels=None,
+                 extra=None):
     """The kernel coordinates of a launch (target or comparable)."""
     desc = {"scale": math.log10(anchor)}
     if pre_peak and pre_peak > 0:
@@ -164,6 +255,8 @@ def _descriptors(anchor, pre_peak, trail_mean=None, channels=None):
         desc["ramp"] = math.log10(anchor / trail_mean)
     if channels and channels > 0:
         desc["vpc"] = math.log10(anchor / channels)
+    if extra:
+        desc.update(extra)
     return desc
 
 
@@ -179,7 +272,10 @@ def _trailing_mean(points, key, lo, hi):
             continue
         if lo <= start < hi:
             vals.append(viewers)
-    return sum(vals) / len(vals) if vals else None
+    if not vals:
+        return None
+    mean = sum(vals) / len(vals)
+    return mean if math.isfinite(mean) else None
 
 
 def _case_anchor(case, day_start_epoch=0.0):
@@ -226,7 +322,10 @@ def _hour1_channels(points, day_start_epoch):
             continue
         if day_start_epoch <= start < day_start_epoch + 3600:
             vals.append(channels)
-    return sum(vals) / len(vals) if vals else None
+    if not vals:
+        return None
+    mean = sum(vals) / len(vals)
+    return mean if math.isfinite(mean) else None
 
 
 def _effective_size(weights):
@@ -249,7 +348,8 @@ def _pool_shapes(case, anchor, target_desc, par):
     own_name = str((case.get("game") or {}).get("name", "")).casefold()
     dims = (("scale", par["bw_scale"]), ("peak", par["bw_peak"]),
             ("front", par["bw_front"]), ("ramp", par["bw_ramp"]),
-            ("vpc", par["bw_vpc"]))
+            ("vpc", par["bw_vpc"]), ("u_e", par["bw_unlock"]),
+            ("u_g", par["bw_unlock"]), ("u_m", par["bw_unlock"]))
     launches = []  # (per-hour log ratios, full weight, scale-only weight)
     for comp in sorted(case.get("comparables") or [],
                        key=lambda c: str(c.get("name", ""))
@@ -271,7 +371,8 @@ def _pool_shapes(case, anchor, target_desc, par):
         own_trail = _trailing_mean(comp.get("hourly"), "from",
                                    start - par["trail_hours"] * 3600, start)
         own_desc = _descriptors(own_anchor, own_peak, own_trail,
-                                _hour1_channels(comp.get("hourly"), start))
+                                _hour1_channels(comp.get("hourly"), start),
+                                _unlock_extra(comp.get("unlock")))
         log_weight = 0.0
         log_scale = None
         usable = True
@@ -392,10 +493,8 @@ def _wanted_hours(case):
     return hours if len(hours) == len(FORECAST_HOURS) else list(FORECAST_HOURS)
 
 
-def forecast_case(case, params=None):
-    par = dict(PARAMS)
-    if params:
-        par.update(params)
+def _forecast_par(case, par):
+    """One forecast pass under a fully resolved parameter set."""
     day_start = _epoch(case.get("day_start")) or 0.0
     anchor = _case_anchor(case, day_start)
     pre_peak = _case_pre_peak(case, day_start)
@@ -408,10 +507,43 @@ def forecast_case(case, params=None):
     for row in case.get("known") or []:
         if isinstance(row, dict) and row.get("hour") == 1:
             channels = _finite(row.get("channels"))
-    target_desc = _descriptors(anchor, pre_peak, trail, channels)
+    target_desc = _descriptors(anchor, pre_peak, trail, channels,
+                               _unlock_extra(case.get("notes")))
     pool = _pool_shapes(case, anchor, target_desc, par)
     return {"hours": [{"hour": h, "q": _hour_row(pool.get(h, []), anchor, h, par)}
                       for h in _wanted_hours(case)]}
+
+
+def forecast_case(case, params=None):
+    """Forecast one case. Note for tuners: in the small regime
+    (< regime_threshold) the peak width and empirical share are
+    governed by small_peak_a/small_peak_b and small_empirical_share;
+    bw_peak and empirical_share passed in params apply to the large
+    regime only."""
+
+    par = dict(PARAMS)
+    if params:
+        par.update(params)
+    anchor = _case_anchor(case, _epoch(case.get("day_start")) or 0.0)
+    if anchor >= par["regime_threshold"]:
+        return _forecast_par(case, par)
+    # Small regime: two neighbouring peak widths with the Gaussian fit
+    # alone, combined as an equal log-space quantile average.
+    parts = []
+    for peak in (par["small_peak_a"], par["small_peak_b"]):
+        sub = dict(par)
+        sub["bw_peak"] = peak
+        sub["empirical_share"] = par["small_empirical_share"]
+        parts.append(_forecast_par(case, sub))
+    rows = []
+    for first, second in zip(parts[0]["hours"], parts[1]["hours"]):
+        q = [math.exp(0.5 * (math.log(a) + math.log(b)))
+             for a, b in zip(first["q"], second["q"])]
+        q = [min(max(v, 0.01), par["cap"]) for v in q]
+        q.sort()
+        rows.append({"hour": first["hour"],
+                     "q": [_clean(v) for v in q]})
+    return {"hours": rows}
 
 
 def _fallback_case(case, params=None):
